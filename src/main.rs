@@ -9,7 +9,6 @@
 
 use panic_halt as _;
 
-// Everything between here and the entrypoint are copied from the arduino-hal repo
 use avr_device::interrupt;
 use core::cell::RefCell;
 use core::arch::asm;
@@ -59,23 +58,21 @@ fn main() -> ! {
 
     // Testing... Are we reading properly from registers?
     // We might need to prevent interrupts here to make sure our register reads
-    // are completely syncrhonous.
+    // are completely synchronous.
     interrupt::free(|_| {
         unsafe {
             asm!(
                 "ldi r16, 0x45",
                 "sts 0x08f7, r16",
             );
-        }
-        // I wasn't paying attention and had r16 = 0x16. That's why we were reading 0.
-        let r16 = 0x10 as *const u16;
-        // We expect the print values to output 69.
-        unsafe {
-            println!("r16 is: {}", *r16);
-            println!("value in SRAM: {}", *(0x08f7 as *const u16) as u8);
+            let r16 = 0x10 as *const usize;
+            // We expect to output 69.
+            println!("r16 is {}", *r16);
+            println!("value in SRAM: {}", *(0x08f7 as *const usize) as u8);
         }
     });
-    
+
+    //println!("testing before fuse bit block");
 
     // We'll load the fuse high byte into r0 first to get the BOOTSZ fuse bits.
     // SPMCSR IO register cannot be accessed directly by SBIS instructions, and
@@ -83,7 +80,7 @@ fn main() -> ! {
     // OR the value.
     //
     // Load SPMCSR's value into r16.
-    // Calculate the value to go into SPMCSR by ORing r116 and 0b00001001.
+    // Calculate the value to go into SPMCSR by ORing r16 and 0b00001001.
     // Load 0x0003 into the Z register.
     // Load our calculated value into SPMCSR, thereby setting the BLBSET and
     // SELFPRGEN bits.
@@ -99,15 +96,17 @@ fn main() -> ! {
         );
     }
 
+    //println!("testing after fuse bit block");
+
     let r0 = 0 as *const u16;
     
     let mut led = pins.d13.into_output();
 
+    //println!("testing right before loop");
+
     loop {
+        println!("testing in loop");
         led.toggle();
         arduino_hal::delay_ms(1000);
-        unsafe {
-            println!("r0 is {}", *r0);
-        }
     }
 }
