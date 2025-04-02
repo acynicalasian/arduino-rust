@@ -44,7 +44,7 @@ macro_rules! println {
 fn put_console(console: Console) {
     interrupt::free(|cs| {
         *CONSOLE.borrow(cs).borrow_mut() = Some(console);
-    })
+    });
 }
 
 #[arduino_hal::entry]
@@ -66,15 +66,15 @@ fn main() -> ! {
                 "ldi r16, 0x45",
                 "sts 0x08f7, r16",
             );
-            let r16 = 0x10 as *const usize;
             // We expect to output 69.
-            println!("r16 is {}", *r16 as u8);
+            let r16val = *(0x10 as *const u8);
+            println!("r16 is {}", r16val);
             //println!("value in SRAM: {}", (*(0x08f7 as *const usize)) as u8);
             println!("unsafe print with no deref fine?");
         }
     });
 
-    println!("testing before fuse bit block");
+    //println!("testing before fuse bit block");
 
     // We'll load the fuse high byte into r0 first to get the BOOTSZ fuse bits.
     // SPMCSR IO register cannot be accessed directly by SBIS instructions, and
@@ -102,11 +102,15 @@ fn main() -> ! {
 
     let mut led = pins.d13.into_output();
 
-    //println!("testing right before loop");
+    println!("testing right before loop");
 
+    unsafe {
+        asm!(
+            "ldi r16, 0x45",
+        );
+    }
     loop {
         println!("testing in loop");
-        println!("printing after OOB memory access");
         led.toggle();
         println!("printing after toggling LED");
         arduino_hal::delay_ms(1000);
