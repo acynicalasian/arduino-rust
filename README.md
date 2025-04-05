@@ -80,7 +80,7 @@ fn main() -> ! {         ; address 0x017a in disassembly
     push    r12
     push    r13
 ```
-Now, what does this actually mean for my project development from now on? I might consider taking a conservative approach and setting `BLB11` to `0` so we allow ourselves to at least read the bootloader. Maybe we could
+Now, what does this actually mean for my project development from now on? I might consider taking a conservative approach and setting `BLB12` to `1` so we allow ourselves to at least read the bootloader. Maybe we could
 dump the contents of the bootloader and pass it into an AVR assembler to see what we get. If it doesn't seem like the bootloader isn't doing much other than a jump to `0x0000` or something, we could always just set
 `BOOTRST` to `1` (?) and set the boot locker bits (`BLBxx`) to `1` to have a fully unlocked bootloader. On the other hand, if there's some sort of arcane magic happening, I could try to experiment with my code in my `main()`
 function and then dump the first couple hundred or thousand bytes of flash memory via console output. If we write faux-bootloader code in the beginning of the `main()` function and then delineate it with an `asm!()` block
