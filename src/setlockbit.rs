@@ -8,10 +8,33 @@
     Dump the contents and transfer it via usart to examine it on our dev computer.
  */
 
-use panic_halt as _;
+ use panic_halt as _;
 
-use avr_device::interrupt;
-use core::arch::asm;
+ use avr_device::interrupt;
+ use core::cell::RefCell;
+ use core::arch::asm;
+ 
+ type Console = arduino_hal::hal::usart::Usart0<arduino_hal::DefaultClock>;
+ static CONSOLE: interrupt::Mutex<RefCell<Option<Console>>> =
+     interrupt::Mutex::new(RefCell::new(None));
+ 
+ macro_rules! println {
+     ($($t:tt)*) => {
+         interrupt::free(
+             |cs| {
+                 if let Some(console) = CONSOLE.borrow(cs).borrow_mut().as_mut() {
+                     let _ = ufmt::uwriteln!(console, $($t)*);
+                 }
+             },
+         )
+     };
+ }
+ 
+ fn put_console(console: Console) {
+     interrupt::free(|cs| {
+         *CONSOLE.borrow(cs).borrow_mut() = Some(console);
+     });
+ }
 
 #[arduino_hal::entry]
 fn main() -> ! {
@@ -57,8 +80,12 @@ fn main() -> ! {
     // Now we'll set up our HAL.
     let dp = arduino_hal::Peripherals::take().unwrap();
     let pins = arduino_hal::pins!(dp);
+    let serial = arduino_hal::default_serial!(dp, pins, 57600);
+    put_console(serial);
 
     let mut led = pins.d13.into_output();
+
+    println!("we done");
 
     loop {
         led.toggle();
