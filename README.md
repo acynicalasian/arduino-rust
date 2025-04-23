@@ -1,6 +1,6 @@
 arduino-rust
 ============
-*last edited on 19 April 2025*
+*last edited on 22 April 2025*
 
 This is a personal project of mine to learn both Rust and embedded systems programming. My code was developed for
 an Arduino Uno R3 from Elegoo. I aim to implement a "firmware update" functionality. As of now, the `README.md` file
@@ -198,7 +198,116 @@ on that post makes a great point about needing position-independent code. Howeve
      problems and have "bricked" our board (in the sense of it probably can't be updated anymore without flashing new firmware externally using `avrdude`). That, however, brings me to my second point.
    - Having a hacky bootloader consistent across firmware versions opens the possibility of simply never touching the bootloader during firmware update processes. This should make the firmware update process even more
      robust and opens the possiblility of only really needing to copy and back up the assembly represented by `main_routine()`, which will allow slightly larger firmware versions.
-  
+
+#### Messing with linker scripts
+
+Using this goated [source](https://mcyoung.xyz/2021/06/01/linker-script/), I think things might be clicking for me a bit. Let's compare some of the output from
+`avr-objdump -x /target/avr-atmega328p/debug/arduino-rust.elf` with that from `avr-objdump -Ds flashdump.elf`.
+
+```
+arduino-rust.elf:     file format elf32-avr
+arduino-rust.elf
+architecture: avr:5, flags 0x00000112:
+EXEC_P, HAS_SYMS, D_PAGED
+start address 0x00000000
+
+Program Header:
+    LOAD off    0x000000b4 vaddr 0x00000000 paddr 0x00000000 align 2**1
+         filesz 0x000001dc memsz 0x000001dc flags r-x
+    LOAD off    0x00000290 vaddr 0x00800100 paddr 0x000001dc align 2**0
+         filesz 0x00000066 memsz 0x00000066 flags rw-
+    LOAD off    0x000002f6 vaddr 0x00800166 paddr 0x00800166 align 2**0
+         filesz 0x00000000 memsz 0x00000004 flags rw-
+   STACK off    0x00000000 vaddr 0x00000000 paddr 0x00000000 align 2**4
+         filesz 0x00000000 memsz 0x00000000 flags rw-
+
+Sections:
+Idx Name          Size      VMA       LMA       File off  Algn
+  0 .data         00000066  00800100  000001dc  00000290  2**0
+                  CONTENTS, ALLOC, LOAD, DATA
+  1 .text         000001dc  00000000  00000000  000000b4  2**1
+                  CONTENTS, ALLOC, LOAD, READONLY, CODE
+  2 .bss          00000004  00800166  00800166  000002f6  2**0
+                  ALLOC
+```
+```
+flashdump.elf:    file format elf32-avr
+
+Contents of section .data:
+; ...
+ 01c0 e1000e94 eb008be3 91e06be2 70e00e94  ..........k.p...
+ 01d0 df000e94 e100ffcf f894ffcf 77656c6c  ............well
+ 01e0 20776861 74206861 7070656e 73206865   what happens he
+ 01f0 72653f61 73736572 74696f6e 20666169  re?assertion fai
+ 0200 6c65643a 2069735f 77726974 696e6728  led: is_writing(
+ 0210 626f7272 6f772963 616c6c65 6420604f  borrow)called `O
+ 0220 7074696f 6e3a3a75 6e777261 70282960  ption::unwrap()`
+ 0230 206f6e20 6120604e 6f6e6560 2076616c   on a `None` val
+ 0240 7565ffff ffffffff ffffffff ffffffff  ue..............
+ 0250 ffffffff ffffffff ffffffff ffffffff  ................
+; ...
+```
+
+Viewing the sections of our ELF file, we see that the `.data` section has a LMA (load memory address) of `0x01dc` and a VMA (virtual memory address) of `0x00800100`. As we can see from the dump of the flash memory, we
+find our string literals at that exact part of memory. Hmm, that's interesting, but even more things are clicking for me from there onwards. Below is disassembled code from our flash dump, `avr-objdump -DS flashdump.elf`:
+
+```assembly
+      68:       11 24           eor     r1, r1
+      6a:       1f be           out     0x3f, r1        ; 63
+      6c:       cf ef           ldi     r28, 0xFF       ; 255
+      6e:       d8 e0           ldi     r29, 0x08       ; 8
+      70:       de bf           out     0x3e, r29       ; 62
+      72:       cd bf           out     0x3d, r28       ; 61
+      74:       11 e0           ldi     r17, 0x01       ; 1
+      76:       a0 e0           ldi     r26, 0x00       ; 0
+      78:       b1 e0           ldi     r27, 0x01       ; 1
+      7a:       ec ed           ldi     r30, 0xDC       ; 220
+      7c:       f1 e0           ldi     r31, 0x01       ; 1
+      7e:       02 c0           rjmp    .+4             ; 0x84 <_binary_flashdump_start+0x84>
+      80:       05 90           lpm     r0, Z+
+      82:       0d 92           st      X+, r0
+      84:       a6 36           cpi     r26, 0x66       ; 102
+      86:       b1 07           cpc     r27, r17
+      88:       d9 f7           brne    .-10            ; 0x80 <_binary_flashdump_start+0x80>
+      8a:       21 e0           ldi     r18, 0x01       ; 1
+      8c:       a6 e6           ldi     r26, 0x66       ; 102
+      8e:       b1 e0           ldi     r27, 0x01       ; 1
+      90:       01 c0           rjmp    .+2             ; 0x94 <_binary_flashdump_start+0x94>
+      92:       1d 92           st      X+, r1
+      94:       aa 36           cpi     r26, 0x6A       ; 106
+      96:       b2 07           cpc     r27, r18
+      98:       e1 f7           brne    .-8             ; 0x92 <_binary_flashdump_start+0x92>
+      9a:       0e 94 53 00     call    0xa6            ; 0xa6 <_binary_flashdump_start+0xa6>
+```
+Interrupt vectors (I think that's what they're called?) are stored at `0x0`, and we see that after a board reset (or at least as far as I can tell, whenever our board's program runs), we `jmp` to `0x68`. Stepping
+through the code from there, let's make a few notes of things. We can ignore `0x68` to `0x72`. [^7] At `0x74`, we're holding `r17`. Then, at `0x76` and `0x78`, we're setting the `X` register to `0x0100`, which
+corresponds to the beginning of SRAM. We then set the `Z` register to `0x01dc` (!) at `0x7a` and `0x7c`. We `rjmp` at `0x7e` to `0x84`, where we compare the low byte of the `X` register to `0x66`. Hmm, didn't the
+ELF file mention the size of the `.data` section was `0x66`? Anyhow, at `0x86`, we compare `r17` and the the high byte of the `X` register (`r26`). At this point, it's becoming clear what the code is trying to do so I
+won't bother getting into the nitty gritty of the carry bits ~~(nor do I want to, when a heuristic analysis is good enough)~~, but our `cpc` instruction at `0x86` should lead us to follow the conditional `brne` 
+relative jump at `0x88`. At `0x80`, we're *loading from program memory* the byte stored at the address stored in the `Z` register. Note that our `Z` register was pointing to `0x01dc`, the LMA of the `.data` section
+according to the ELF file and where we found our string literals in the dump of our Arduino's flash memory! At `0x82`, we store `r0` at the address pointed by the `X` register and then increment the `X` register. Hmm,
+the `X` register was holding `0x0100` when we last checked, which happens to correspond to the beginning of SRAM. And although `0x00800100` wouldn't be a valid memory address in the address space of our MCU, dropping
+the top four bits gives us another `0x0100`, which lines up with the VMA of our `data` section. This can't be a coincidence, and the purpose of this code becomes pretty clear. We compare the lower byte of the `X`
+register again at `0x84`, and now it becomes clear that we're probably looping `0x66` times in the code to copy the string literals in our program to the beginning of SRAM.
+
+I've learned a couple things from this. First, this confirms that our compiler is automatically storing string literals past the code section of our flash memory. Second, I can probably use the `-x` option of
+`avr-objdump` to see the ELF headers and see where the compiler is deciding to store string literals. The problem is, I want to make sure some of the string literals always end up in our hacky bootloader because we
+need access to strings to label diagnostic info in our serial output.
+
+This is where tweaking our linker comes in. Doing a bit of high-level research in ChatGPT, I've come across two methods to make sure our hacky bootloader contains diagnostic strings. The first method could be to bury
+our text data as raw bytes in inline assembly. [^8] To the best of my knowledge, `asm!()` blocks can't really be optimized by our compiler, so any `asm!()` blocks I write should end up intact in compiled code.
+```assembly
+ldi r16, 0x45                    ; foo
+rjmp .+18                        ; jump past the next 18 bytes, which contain raw byte data that doesn't correspond to (intended) code
+dxstr: .DB "Not 0-terminated!"   ; we have an odd # of chars; I believe we'll probably get a zero-byte here automatically.
+ldi r17, 0x45                    ; if we label this line, I believe we can rjmp to it using the label as well.
+```
+I'm a bit hesitant about this first method because it could be a massive PITA to actually extract our string literals from program memory when using `println!()`. I'm not even sure if this code would work in inline
+assembly because some of this code came from the guide to the [AVR assembler](https://ww1.microchip.com/downloads/en/DeviceDoc/40001917A.pdf). With or without labels in assembly, could I easily refer back to where I
+stored my string literals in program memory? There's just too many questions.
+
+From a bit of high-level research using ChatGPT as a guide, apparently I can create a linker script and label sections of code with `![unsafe(link_section=".my_section_name_here")]`. That's where this
+[guide](https://mcyoung.xyz/2021/06/01/linker-script/) is probably gonna carry me. For now, this is the approach I've settled on to write and structure my hacky bootloader.
 
 ## How to run
 
@@ -239,3 +348,6 @@ be dual licensed as above, without any additional terms or conditions.
 [^4]:https://ww1.microchip.com/downloads/aemDocuments/documents/MCU08/ProductDocuments/DataSheets/Atmel-7810-Automotive-Microcontrollers-ATmega328P_Datasheet.pdf#G1204617
 [^5]:https://ww1.microchip.com/downloads/aemDocuments/documents/MCU08/ProductDocuments/DataSheets/Atmel-7810-Automotive-Microcontrollers-ATmega328P_Datasheet.pdf#G1204744
 [^6]:Realistically, I don't see ourselves bricking the board, especially if we keep `BLB11` and `BLB12` set to `0` so the bootloader section of flash memory is RW-protected.
+[^7]:`0x68` should zero out `r1`. `0x6a` zeroes out the register that holds carry bits. `0x6c` and `0x6e` sets the `Y` register to `0x8ff`, which corresponds to the highest address in SRAM. `0x70` and `0x72` set the
+high and low bytes of the stack register respectively.
+[^8]:https://ww1.microchip.com/downloads/en/DeviceDoc/40001917A.pdf#_OPENTOPIC_TOC_PROCESSING_d114e1545
