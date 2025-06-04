@@ -25,6 +25,11 @@ use core::arch::asm;                    // For inline assembly.
 mod main_routine;
 use main_routine::main_routine as main_routine;
 
+mod flash;
+use flash::read_highbyte as read_highbyte;
+use flash::read_lowbyte as read_lowbyte;
+
+
 /*
     Define variables and functions needed for serial output.
  */
