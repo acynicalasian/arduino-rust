@@ -5,15 +5,14 @@
 
     Important note: flash memory is WORD-ADDRESSED rather than BYTE-ADDRESSED.
 
-    Big warning: we have no memory management built into our "bootloader"/"OS". As I understand it,
-    NONE of Rust's memory safety guarantees apply if we do things in `unsafe` blocks (which is
-    basically most of our code at this point considering how low-level it is) so I simply can't
-    guarantee that if I return a pointer to some arbitrary value in SRAM when we read `n` bytes
-    flash memory, the SRAM pointer will still be valid and we won't have overwritten any of that
-    memory. I mean, we also just have no concept of a heap whatsoever in `no-std` environments. To
-    try to make things safer, I've restricted reading flash memory to 256 bytes at a time and have
-    explicitly reserved 256 bytes of RAM. I hate using so much RAM here, but flash IO is important
-    enough that I think I can justify reserving this amount.
+    Big warning: we have no memory management built into our "bootloader"/"OS", not to mention that
+    because we're in a `no-std` environment, there's no concept of a heap whatsoever. I doubt that
+    we'll run into memory issues, but to alleviate some potential pain, I've hard capped the size
+    of the arrays we use to back up flash memory pages and to hold the bytes we read from flash.
+    Unfortunately, we seemingly have to return raw pointers, so be *VERY* aware that I can't stop
+    whoever uses this code from accessing memory before `READBUF` or past the `n` bytes we read and
+    copied into `READBUF`. As for reserving a big chunk of memory (roughly 38% of RAM?), hopefully
+    on-board flash memory management is important enough that this memory reservation is justified.
 
     There honestly *might* be a HAL provided by arduino_hal or one of its related crates for flash
     storage management but it's so heavily abstracted that I'm having trouble even understanding
@@ -24,74 +23,44 @@
 use panic_halt as _;
 use core::arch::asm;
 
-const MAX_MEM_ADDR: u16 = 0x3EFF;       // We probably can't write past 0x3EFF in flash because of
-                                        // the lock bits, which prevent SPM instructions from
-                                        // operationg on the boot section of flash memory, not to
-                                        // mention this is also undesirable behavior for us since
-                                        // we want to make it easier to flash the Arduino.
-const RZ: u8 = 0x1E;
-const RZ_LOW: u8 = RZ;
-const RZ_HIGH: u8 = RZ + 1;
-const R16: u8 = 0x10;
-
 /*
-    The static keyword here *should* reserve a byte of RAM that will remain valid throughout the
-    lifetime of my program. That means that I won't ever have to worry about which registers the
-    compiler decides to use... worrying that I unintentionally overwrote the register being used
-    to hold a value read from flash before returning the value read won't be a problem anymore.
+    We probably can't write past 0x3EFF in flash because of the lock bits, which prevent SPM
+    instructions from operating on the boot section of flash memory, not to mention this is also
+    undesirable behavior for us since we want to make it easier to flash the Arduino.
  */
-#[used]
-static mut READBYTE: u8 = 0;
+pub const MAX_MEM_ADDR: usize = 0x3EFF;
 
 /*
     From what I can glean online, there is no dedicated page buffer when writing to flash memory
     one page at a time. That means we need to reserve 128 bytes (64 words) of SRAM if we write to
     flash.
 */
+pub const MAX_PAGEBUF_SIZE: usize = 128;    // DO NOT CHANGE THIS VALUE!!
 #[used]
-static mut PAGEBUF: [u8; 128] = [0; 128];
+static mut PAGEBUF: [u8; MAX_PAGEBUF_SIZE] = [0; MAX_PAGEBUF_SIZE];
 
 /*
-    As mentioned earlier, we'll explicitly reserve 256 bytes of RAM for reading flash memory.
+    As mentioned earlier, we'll explicitly reserve 128 bytes of RAM for reading flash memory.
     This will get overwritten with every new read we do to memory!
 
-    Assuming you read `n` bytes where `n` < 256, reading past `n` bytes in `READBUF` will never
-    fail but will result in undefined behavior. You'll either read zeroes (we haven't read more
-    than `n` bytes yet) or get data from a previous read operation that's no longer valid.
+    Assuming you read `n` bytes where `n` < 128, reading past `n` bytes in `READBUF` will never
+    fail because READBUF has a
+
+    Reading past `n` bytes leads to undefined behavior.
+
+    We can separate the max size for `READBUF` into a `const` here so editing it is easier in the
+    future. Just be aware that once we start writing linker scripts to include this library in our
+    hacky bootloader, changing this value directly changes the bootloader size.
 */
+pub const MAX_READBUF_SIZE: usize = 256;
 #[used]
-static mut READBUF: [u8; 256] = [0; 256];
-
-/*
-    Reserve some memory where we can back up the arguments passed to these functions; because the
-    compiler treats inline assembly as a black box, I have no clue whether I can guarantee that
-    there will never be register collisions even if I back up the values of registers I know my
-    functions will use.
-    
-    i.e.
-        READBUF[i] = *(R16 as *const u8);
-
-    `READBUF[i]` should lead to a 16-bit value... what if we're using r16 to store the address of
-    `READBUF`? Or, what if r16 was used to hold the number of bytes to read/write or the offset?
-    This type of confusion is very undesirable so we'll back up these values since static values
-    have a location in SRAM that'll never change.
- */
-#[used]
-static mut ADR_BACKUP: u16 = 0;
-#[used]
-static mut INPUTBYTE_BACKUP: u8 = 0;
-#[used]
-static mut INPUTPTR_BACKUP: u16 = 0;
-#[used]
-static mut NUMBYTES_BACKUP: u8 = 0;
-#[used]
-static mut OFFSET_BACKUP: u8 = 0;
+static mut READBUF: [u8; MAX_READBUF_SIZE] = [0; MAX_READBUF_SIZE];
 
 /*
     Read and return the high byte of the word in flash memory at address `adr`.
  */
 #[inline(always)]
-pub unsafe fn read_highbyte(adr: u16) -> u8 {
+pub unsafe fn read_highbyte(adr: usize) -> u8 {
     return _read_byte(adr, 1);
 }
 
@@ -99,17 +68,18 @@ pub unsafe fn read_highbyte(adr: u16) -> u8 {
     Read and return the low byte of the word in flash memory at address `adr`.
  */
 #[inline(always)]
-pub unsafe fn read_lowbyte(adr: u16) -> u8 {
+pub unsafe fn read_lowbyte(adr: usize) -> u8 {
     return _read_byte(adr, 0);
 }
 
 /*
-    Read `n` bytes starting at flash memory address `adr` and return a pointer to `READBUF`. We
-    (hopefully) can't modify `READBUF` outside of this library, so we can return a `const` raw
-    pointer. This function always starts at the low byte of the word.
+    Read `n` bytes starting at flash memory address `adr` and return a raw pointer to `READBUF`.
+    Apparently, I can't just return an immutable reference to `READBUF`, so unfortunately, I have
+    no way to guarantee that we can't access memory before `READBUF` or past the `n` bytes we read.
+    Be very, very aware!!
 */
 #[inline(always)]
-pub unsafe fn read_nbytes(adr: u16, n: u8) -> *const u8 {
+pub unsafe fn read_nbytes(adr: usize, n: usize) -> *const u8 {
     _read_nbytes(adr, n, 0);
     return &READBUF[0];
 }
@@ -119,7 +89,7 @@ pub unsafe fn read_nbytes(adr: u16, n: u8) -> *const u8 {
     the high byte of the word at `adr`.
 */
 #[inline(always)]
-pub unsafe fn read_nbytes_starthigh(adr: u16, n: u8) -> *const u8 {
+pub unsafe fn read_nbytes_starthigh(adr: usize, n: usize) -> *const u8 {
     _read_nbytes(adr, n, 1);
     return &READBUF[0];
 }
@@ -129,7 +99,7 @@ pub unsafe fn read_nbytes_starthigh(adr: u16, n: u8) -> *const u8 {
     from the low byte of a word.
 */
 #[inline(always)]
-pub unsafe fn read_nbytes_startlow(adr: u16, n: u8) -> *const u8 {
+pub unsafe fn read_nbytes_startlow(adr: usize, n: usize) -> *const u8 {
     return read_nbytes(adr, n);
 }
 
@@ -140,48 +110,63 @@ pub unsafe fn read_nbytes_startlow(adr: u16, n: u8) -> *const u8 {
     application memory when implementing our A/B firmware upgrade system.
  */
 #[inline(always)]
-pub unsafe fn write_highbyte(adr: u16, input: u8) {
-    return write_byte(adr, 1, input);
+pub unsafe fn write_highbyte(adr: usize, input: u8) {
+    return _write_byte(adr, 1, input);
 }
 
 /*
     Low byte equivalent to above.
 */
 #[inline(always)]
-pub unsafe fn write_lowbyte(adr: u16, input: u8) {
-    return write_byte(adr, 0, input);
+pub unsafe fn write_lowbyte(adr: usize, input: u8) {
+    return _write_byte(adr, 0, input);
 }
 
 #[inline(always)]
-unsafe fn _read_byte(adr: u16, offset: u8) -> u8 {
+unsafe fn _read_byte(adr: usize, offset: u8) -> u8 {
     _check_adr(adr);
+    let res: u8;
     unsafe {
-        _lpm_backup_regs();
-        _lpm_setup_zreg(adr, offset);
-        // Load our target byte into r16 and then into READBYTE.
+        _lpm_setup_regs(adr, offset);
+        // Load our target byte into the register used by `res` and then restore our Z register.
         asm!(
-            "lpm r16, Z",
+            "lpm {res}, Z", res = out(reg) res,
         );
-        READBYTE = *(R16 as *const u8);
         _lpm_restore_regs();
     }
-    return READBYTE;
+    return res;
 }
 
-unsafe fn _read_nbytes(adr: u16, n: u8, offset: u8) {
+/*
+    Read `n` bytes from flash memory starting from address `adr`
+*/
+unsafe fn _read_nbytes(adr: usize, n: usize, offset: u8) {
     _check_adr(adr);
+    _check_numbytes(n);
     unsafe {
-        _lpm_backup_regs();
-        _lpm_setup_zreg(adr, offset);
+        _lpm_setup_regs(adr, offset);
     }
     for i in 0..n as usize {
-        // Load our target byte into r16 and then into READBUF. We don't need to back up r16 and
-        // the Z register every time we read a byte. We'll just back things up at the end.
-
+        let b: u8;
+        // Use LPM with post-increment because we can take advantage of how the Z register value is
+        // structured... if we read the low byte at an address, we need to read the high byte next,
+        // and the lowest bit in the Z register controls this! If we read the high byte at an
+        // address, we want to read the next memory address starting from the low byte. We know the
+        // lowest bit is 1... incrementing sets this to 0, and we add the carry to the next bit,
+        // which is the lowest significant bit of the target memory address.
+        unsafe {
+            asm!(
+                "lpm {b}, Z+", b = out(reg) b,
+            );
+            READBUF[i] = b;
+        }
+    }
+    unsafe {
+        _lpm_restore_regs();
     }
 }
 
-unsafe fn write_byte(adr: u16, offset: u8, input: u8) {
+unsafe fn _write_byte(adr: usize, offset: u8, input: u8) {
     _check_adr(adr);
     unsafe {
         return;
@@ -189,72 +174,56 @@ unsafe fn write_byte(adr: u16, offset: u8, input: u8) {
 }
 
 #[inline(always)]
-fn _check_adr(adr: u16) {
+fn _check_adr(adr: usize) {
     if adr > MAX_MEM_ADDR {
         // Halt on failure.
         panic!("Attempted to access invalid flash memory address!");
     }
 }
+#[inline(always)]
+fn _check_numbytes(n: usize) {
+    if n > MAX_READBUF_SIZE {
+        // Halt on failure.
+        panic!("Attempted to read more than 256 bytes at a time!");
+    }
+}
 
 /*
-    Set up the necessary registers for an LPM instruction.
+    Set up the necessary registers for an LPM instruction by calculating the proper value for the Z
+    register and backing up the Z register before actually running the LPM instruction.
 */
 #[inline(always)]
-unsafe fn _lpm_backup_regs() {
+unsafe fn _lpm_setup_regs(adr: usize, offset: u8) {
+    // LPM uses our target address, bit shifts it left once (multiplies by 2), and uses the lowest
+    // bit (our offset) to determine whether we're reading the high or low byte of the 2-byte word
+    // at `adr`. Hopefully our compiler knows to store `zreg_value` in two consecutive registers
+    // because we're going to use a format string with an MOVW instruction to copy our calculuated
+    // `zreg_value` into the Z register.
+    let zreg_value = (adr*2) + offset as usize;
     unsafe {
         asm!(
             "cli",              // Disable interrupts
-            "push r28",         // Back up Y-register
-            "push r29",
-            "push r30",         // Back up Z-register
+            "push r30",         // Back up Z-register, used for LPM instructions
             "push r31",
-            "push r16",         // Back up r16, we'll use it to hold the byte we read
+            "movw r30, {z}",    // Load the Z-register with the formatted address for LPM.
+            z = in(reg) zreg_value as u8,   // Hopefully this cast doesn't trigger an internal MOV
+                                            // instruction that separates the low and high bytes of
+                                            // `zreg_value`!
         );
     }
 }
 
 /*
-    Restore the registers we used for an LPM instruction to avoid the side effects of using this
-    code... Our compiler can't check inline assembly code so we need to be able to guarantee that
-    our code didn't mess up register values if we perform RW operations in the middle of code that
-    we didn't write or can't guarantee the behavior of.
+    Restore the registers we used for an LPM instruction and reenable interrupts to avoid the side
+    effects of using this code.
 */
 #[inline(always)]
 unsafe fn _lpm_restore_regs() {
     unsafe {
-        // Fix our registers and reenable interrupts... we only wanted to read one byte.
         asm!(
-            "pop r16",
             "pop r31",
             "pop r30",
-            "pop r29",
-            "pop r28",
             "sei",
         );
-    }
-}
-
-/*
-    Setup our Z-register with the correct address for an LPM instruction.
-*/
-#[inline(always)]
-unsafe fn _lpm_setup_zreg(adr: u16, offset: u8) {
-    unsafe {
-        // Set the Z-register to our target address. `offset` determines whether we took the high
-        // or low byte of the word at `adr`.
-        // This code feels insanely hacky since we're operating on two different registers like
-        // they're memory, but I don't see how this wouldn't work. It's a lot more readable than
-        // taking the "sure" approach of calculating the offset address and assigning the high
-        // byte to r31 and the low byte to r30. Hopefully the compiler is smart enough to tell that
-        // I want to put the low byte of `offset_adr` into r30 and the high byte into r31.
-        let offset_adr = adr*2;
-        *(RZ as *mut u16) = offset_adr;
-        // This hacky cast helps ensure that I can pass `offset` as a u8, which makes sure I only
-        // use one register. Extremely nitpicky but it could matter? Otherwise, I have to do
-        // `*(RZ as *mut u16) = offset_adr + (offset as u16)` because the linter complains about
-        // type incompatibility between u16 and u8. And then at that point, I have to wonder if the
-        // compiler will be smart enough to realize `offset` will never be greater than 1 and use
-        // just one register accordingly.
-        *(RZ as *mut u8) += offset;
     }
 }
